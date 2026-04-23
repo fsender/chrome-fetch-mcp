@@ -1,0 +1,4 @@
+node_modules/
+dist/
+*.js.map
+test_html_to_md/

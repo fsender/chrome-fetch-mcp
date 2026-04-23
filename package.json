@@ -1,0 +1,22 @@
+{
+  "name": "chrome-fetch-mcp",
+  "version": "1.0.2",
+  "description": "MCP server that fetches web content via local Chrome browser with inherited login state",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "chrome-fetch-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "chrome-remote-interface": "^0.33.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.3",
+    "typescript": "^5.8.3"
+  }
+}
