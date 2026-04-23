@@ -59,7 +59,7 @@ const TOOL_DESCRIPTION = `Fetch web page content through local Chrome/Chromium b
 Config via env: CHROME_DEBUG_PORT, DEFAULT_FORMAT, DEFAULT_TIMEOUT, DEFAULT_MAX_BYTES, DEFAULT_REMOVE_REDUNDANT, DEFAULT_WAIT_AFTER_LOAD.`;
 
 const server = new Server(
-  { name: "chrome-fetch-mcp", version: "1.0.2" },
+  { name: "chrome-fetch-mcp", version: "1.1.0" },
   { capabilities: { tools: {} } }
 );
 
