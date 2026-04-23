@@ -140,12 +140,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     };
   }
 
-  let target: { id: string } | null = null;
+  let targetId: string | null = null;
   let client: { close: () => Promise<void> } | null = null;
 
   try {
+    let version: Record<string, string>;
     try {
-      await CDP.Version({ port: CONFIG.chromePort });
+      version = await CDP.Version({ port: CONFIG.chromePort });
     } catch {
       return {
         content: [
@@ -158,8 +159,32 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       };
     }
 
-    target = await CDP.New({ port: CONFIG.chromePort, url: "about:blank" });
-    client = await CDP({ target, port: CONFIG.chromePort });
+    let browserClient: { close: () => Promise<void> } | null = null;
+    try {
+      const wsUrl = version.webSocketDebuggerUrl;
+      if (wsUrl) {
+        browserClient = await CDP({ target: wsUrl });
+        const { Target: TargetDomain } = browserClient as any;
+        const result = await TargetDomain.createTarget({
+          url: "about:blank",
+          background: true,
+        });
+        targetId = result.targetId;
+        await (browserClient as any).close();
+        browserClient = null;
+      }
+    } catch {
+      try { if (browserClient) await browserClient.close(); } catch {}
+    }
+
+    if (!targetId) {
+      const fallback = await CDP.New({ port: CONFIG.chromePort, url: "about:blank" });
+      targetId = fallback.id;
+    }
+
+    const targets = await CDP.List({ port: CONFIG.chromePort });
+    const pageTarget = targets.find((t: any) => t.id === targetId);
+    client = await CDP({ target: pageTarget || targetId, port: CONFIG.chromePort });
     const { Page, Runtime } = client as any;
 
     await Page.enable();
@@ -272,7 +297,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (client) await client.close();
     } catch {}
     try {
-      if (target) await CDP.Close({ id: target.id, port: CONFIG.chromePort });
+      if (targetId) await CDP.Close({ id: targetId, port: CONFIG.chromePort });
     } catch {}
   }
 });
