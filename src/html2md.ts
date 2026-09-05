@@ -394,7 +394,7 @@ export class HtmlToMarkdown {
   }
 
   private clean(md: string): string {
-    return md
+    let out = md
       .replace(/[\uE000-\uF8FF\uF000-\uFFFF]/g, "")
       .replace(/\[([^\]]*)\]\(([^)]*)\)/g, (full, text, url) => {
         return text.trim() ? full : "";
@@ -412,8 +412,22 @@ export class HtmlToMarkdown {
       .replace(/\n{2,}(---)/g, "\n$1")
       .replace(/(---)\n{2,}/g, "$1\n")
       .replace(/\n{2,}(- |\d+\. )/g, "\n$1")
-      .replace(/^[ \t]+$/gm, "")
       .replace(/(\|)\s{2,}(\|)/g, "$1 $2")
       .trim();
+
+    const lines = out.split("\n");
+    const buf: string[] = [];
+    let blanks = 0;
+    for (const ln of lines) {
+      if (ln.trim() === "") {
+        blanks++;
+        if (blanks > 1) continue;
+      } else {
+        blanks = 0;
+      }
+      buf.push(ln);
+    }
+    out = buf.join("\n").trim();
+    return out;
   }
 }
