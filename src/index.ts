@@ -36,12 +36,14 @@ function buildExtractScript(opts: {
   clean: boolean;
   fullPage: boolean;
   keepImageLinks: boolean;
+  reddit?: boolean;
 }): string {
-  const { clean, fullPage, keepImageLinks } = opts;
+  const { clean, fullPage, keepImageLinks, reddit } = opts;
   return `(() => {
   var CLEAN = ${clean ? 1 : 0};
   var FULL_PAGE = ${fullPage ? 1 : 0};
   var KEEP_IMG = ${keepImageLinks ? 1 : 0};
+  var REDDIT = ${reddit ? 1 : 0};
   var baseUrl = location.href;
 
   function removeSel(root, sel) {
@@ -300,11 +302,23 @@ function buildExtractScript(opts: {
       }
     }
   }
+  function deepClone(n) {
+    var c = n.cloneNode(false);
+    if (n.shadowRoot && n.shadowRoot.mode === 'open') {
+      var kids = [];
+      for (var i = 0; i < n.childNodes.length; i++) kids.push(n.childNodes[i]);
+      for (var s = 0; s < n.shadowRoot.childNodes.length; s++) kids.push(n.shadowRoot.childNodes[s]);
+      for (var a = 0; a < kids.length; a++) c.appendChild(deepClone(kids[a]));
+    } else {
+      for (var b = 0; b < n.childNodes.length; b++) c.appendChild(deepClone(n.childNodes[b]));
+    }
+    return c;
+  }
 
   try {
     var title = document.title || '';
     var url = location.href;
-    var docEl = document.documentElement ? document.documentElement.cloneNode(true) : null;
+    var docEl = document.documentElement ? deepClone(document.documentElement) : null;
     if (!docEl) return JSON.stringify({ title: title, url: url, html: '', links: [] });
     var body = docEl.querySelector('body') || docEl;
     if (!body) return JSON.stringify({ title: title, url: url, html: '', links: [] });
@@ -354,7 +368,57 @@ function buildExtractScript(opts: {
     dedupeAnchors(body);
     pruneEmpty(body);
 
-    var main = (!FULL_PAGE) ? findMain(body) : body;
+    var main;
+    if (REDDIT && !FULL_PAGE) {
+      var isComments = location.pathname.indexOf('/comments/') !== -1;
+      var isSearch = location.pathname.indexOf('/search') !== -1;
+      var isOldHost = location.hostname.indexOf('old.reddit.com') === 0;
+      if (isSearch && !isOldHost) {
+        var sw = body.ownerDocument.createElement('div');
+        var seenS = {};
+        var asS = body.querySelectorAll('a[href*="/comments/"]');
+        for (var s1 = 0; s1 < asS.length; s1++) {
+          var aa = asS[s1];
+          var hrefS = aa.getAttribute('href') || '';
+          if (!hrefS || seenS[hrefS]) continue;
+          seenS[hrefS] = 1;
+          var titleS = elText(aa);
+          if (!titleS) {
+            var hd = aa.closest('h1,h2,h3,h4');
+            if (hd) titleS = elText(hd);
+          }
+          if (!titleS || titleS.length < 6 || titleS.length > 300) continue;
+          var seg = body.ownerDocument.createElement('p');
+          var ln = body.ownerDocument.createElement('a');
+          ln.setAttribute('href', hrefS);
+          ln.textContent = titleS;
+          seg.appendChild(ln);
+          var card = aa;
+          for (var up = 0; up < 6 && card && card !== body; up++) {
+            card = card.parentElement;
+            if (!card) break;
+            var px = card.querySelectorAll('p');
+            var sn2 = '';
+            for (var q2 = 0; q2 < px.length; q2++) {
+              var tx2 = elText(px[q2]);
+              if (tx2.length >= 20 && tx2 !== titleS && tx2.indexOf('/comments/') === -1) { sn2 = tx2; break; }
+            }
+            if (sn2) {
+              var brk = body.ownerDocument.createElement('br');
+              seg.appendChild(brk);
+              seg.appendChild(body.ownerDocument.createTextNode(sn2.substring(0, 260)));
+              break;
+            }
+          }
+          sw.appendChild(seg);
+        }
+        main = sw.childNodes.length ? sw : body;
+      } else {
+        main = isComments ? body : findMain(body);
+      }
+    } else {
+      main = (!FULL_PAGE) ? findMain(body) : body;
+    }
     var outRoot = main && main.parentNode ? main : body;
 
     removeAttrs(outRoot);
@@ -376,7 +440,7 @@ function buildExtractScript(opts: {
 async function runScript(
   url: string,
   script: string,
-  opts: { timeout?: number; waitAfterLoad?: number } = {}
+  opts: { timeout?: number; waitAfterLoad?: number; foreground?: boolean } = {}
 ): Promise<string> {
   const timeout = opts.timeout || CONFIG.defaultTimeout;
   const waitAfterLoad = opts.waitAfterLoad || CONFIG.defaultWaitAfterLoad;
@@ -423,6 +487,9 @@ async function runScript(
       Page.loadEventFired(() => resolve());
     });
     await Page.navigate({ url });
+    if (opts.foreground) {
+      try { await Page.bringToFront(); } catch {}
+    }
     const timeoutPromise = new Promise<never>((_, reject) => {
       setTimeout(() => reject(new Error(`Navigation timeout after ${timeout}ms`)), timeout);
     });
@@ -453,6 +520,7 @@ const SEARCH_ENGINES = [
   "duckduckgo",
   "wikipedia",
   "wikidata",
+  "reddit",
 ] as const;
 type SearchEngine = (typeof SEARCH_ENGINES)[number];
 
@@ -470,6 +538,8 @@ function searchUrl(engine: SearchEngine, query: string, page: number): string {
       return `https://en.wikipedia.org/w/index.php?search=${q}&fulltext=1&limit=20&offset=${(p - 1) * 20}`;
     case "wikidata":
       return `https://www.wikidata.org/w/index.php?search=${q}&fulltext=1&uselang=en&limit=20&offset=${(p - 1) * 20}`;
+    case "reddit":
+      return `https://old.reddit.com/search?q=${q}`;
   }
 }
 
@@ -577,6 +647,31 @@ function buildSearchParseScript(engine: SearchEngine): string {
         if (sn) s4 = clean(sn.textContent);
         add(t4, u4, s4, row);
       }
+    } else if (ENGINE === 'reddit') {
+      var seenR = {};
+      function grabOne(container) {
+        var titleA = container.querySelector('.search-result-header a, a.title');
+        if (!titleA) return;
+        var href = titleA.getAttribute('href') || '';
+        if (!href || href.indexOf('/comments/') === -1) return;
+        if (seenR[href]) return;
+        seenR[href] = 1;
+        var t = clean(titleA.textContent);
+        var s = '';
+        var snip = container.querySelector('.search-result-body, .search-result-snippet');
+        if (!snip) {
+          var ps2 = container.querySelectorAll('.expando .md p, .md p');
+          for (var x = 0; x < ps2.length && !s; x++) { var px2 = clean(ps2[x].textContent); if (px2.length > 15) s = px2; }
+        } else { s = clean(snip.textContent); }
+        add(t, href, s || '', container);
+      }
+      var cnts = document.querySelectorAll('.search-result, .search-result-container');
+      var hasCompact = false;
+      for (var c1 = 0; c1 < cnts.length; c1++) { if (cnts[c1].querySelector('.search-result-header a')) hasCompact = true; grabOne(cnts[c1]); }
+      if (!hasCompact) {
+        var things = document.querySelectorAll('.thing.link, div.thing');
+        for (var c2 = 0; c2 < things.length; c2++) grabOne(things[c2]);
+      }
     }
     return JSON.stringify({ results: results });
   })()`;
@@ -594,14 +689,14 @@ This tool is read-only and only return each result's title, snippet and target U
 
 Pass the query as plain natural-language text. **Don't percent-encode it**.
 
-Supported engines: google (default), bing, duckduckgo, wikipedia and wikidata.
+Supported engines: google (default), bing, duckduckgo, wikipedia, wikidata and reddit.
 
-Parameters: query (plain text), engine (optional), page (optional, 1-based; 2 opens the next results page via each engine's start/first/s/offset).
+Parameters: query (plain text), engine (optional), page (optional, 1-based; 2 opens the next results page via each engine's start/first/s/offset; reddit returns one results page).
 
 Returns JSON: {"engine", "query", "page", "results": [{"title", "url", "snippet"}, ...]}. Use it to find candidate links, then open the most relevant ones with web-url-fetch.`;
 
 const server = new Server(
-  { name: "chrome-fetch-mcp", version: "1.2.0" },
+  { name: "chrome-fetch-mcp", version: "1.2.1" },
   { capabilities: { tools: {} } }
 );
 
@@ -668,9 +763,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           engine: {
             type: "string",
-            enum: ["google", "bing", "duckduckgo", "wikipedia", "wikidata"],
+            enum: ["google", "bing", "duckduckgo", "wikipedia", "wikidata", "reddit"],
             description:
-              "Search engine: google (default), bing, duckduckgo, wikipedia, wikidata. Baidu/Sogou/360 are not supported. wikipedia/wikidata return English results by default; other engines follow the browser's language",
+              "Search engine: google (default), bing, duckduckgo, wikipedia, wikidata, reddit. wikipedia/wikidata return English results by default; reddit searches reddit via old.reddit.com; other engines follow the browser's language",
           },
           page: {
             type: "number",
@@ -736,13 +831,54 @@ async function handleFetch(args: Record<string, unknown>): Promise<CallToolResul
     };
   }
 
+  const reddit = /(^|\.)reddit\.com$/i.test(new URL(url).hostname);
+  const redditSearch = reddit && new URL(url).pathname.indexOf("/search") !== -1;
+  const redditWait = reddit ? Math.max(waitAfterLoad, 2500) : waitAfterLoad;
+  const isOldUrl = url.includes("old.reddit.com");
+
+  let targetUrl = url;
+  if (redditSearch && !isOldUrl) {
+    targetUrl = url.replace(/https?:\/\/(www\.|new\.)?reddit\.com/i, "https://old.reddit.com");
+  }
+
   const script = buildExtractScript({
     clean: removeRedundant,
     fullPage,
     keepImageLinks,
+    reddit,
   });
-  const value = await runScript(url, script, { timeout, waitAfterLoad });
-  const rawData = JSON.parse(value);
+  let value = await runScript(targetUrl, script, {
+    timeout,
+    waitAfterLoad: redditWait,
+  });
+  let rawData = JSON.parse(value);
+
+  if (
+    reddit &&
+    !fullPage &&
+    new URL(url).pathname.indexOf("/comments/") !== -1 &&
+    !isOldUrl
+  ) {
+    const htmlLen = String(rawData.html || "").length;
+    const text = String(rawData.html || "").toLowerCase();
+    const looksEmpty =
+      htmlLen < 600 ||
+      text.indexOf("couldn't load") !== -1 ||
+      text.indexOf("sorry, we couldn") !== -1;
+    if (looksEmpty) {
+      const oldUrl = url.replace(
+        /https?:\/\/(www\.|new\.|old\.)?reddit\.com/i,
+        "https://old.reddit.com"
+      );
+      if (oldUrl !== targetUrl) {
+        value = await runScript(oldUrl, script, {
+          timeout,
+          waitAfterLoad: waitAfterLoad || CONFIG.defaultWaitAfterLoad,
+        });
+        rawData = JSON.parse(value);
+      }
+    }
+  }
   const { title, url: finalUrl, html, links, error: extractError } = rawData;
 
   if (extractError) {
@@ -809,7 +945,7 @@ async function handleSearch(args: Record<string, unknown>): Promise<CallToolResu
       content: [
         {
           type: "text" as const,
-          text: `Error: Unsupported engine '${engine}'. Supported: google, bing, duckduckgo, wikipedia, wikidata. Baidu/Sogou/360 are not supported.`,
+          text: `Error: Unsupported engine '${engine}'. Supported: google, bing, duckduckgo, wikipedia, wikidata, reddit.`,
         },
       ],
       isError: true,
