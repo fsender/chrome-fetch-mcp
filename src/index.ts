@@ -620,18 +620,20 @@ function buildSearchParseScript(engine: SearchEngine): string {
         add(t2, u2, s2, li);
       }
     } else if (ENGINE === 'duckduckgo') {
-      var res = document.querySelectorAll('div.result, .result');
-      for (var k = 0; k < res.length; k++) {
-        var r = res[k];
-        if (isAd(r)) continue;
-        var a3 = r.querySelector('.result__a');
-        if (!a3) continue;
-        var t3 = clean(a3.textContent);
-        var u3 = a3.getAttribute('href') || '';
-        var s3 = '';
-        var sp = r.querySelector('.result__snippet');
-        if (sp) s3 = clean(sp.textContent);
-        add(t3, u3, s3, r);
+      var ddgA = document.querySelectorAll('.result__a, .result-link, a.result-link, .results .result a');
+      var seenD = {};
+      for (var dg = 0; dg < ddgA.length; dg++) {
+        var ad = ddgA[dg];
+        var ud = ad.getAttribute('href') || '';
+        if (!ud || seenD[ud]) continue;
+        seenD[ud] = 1;
+        var box = ad.closest('.result') || ad.parentElement;
+        if (!box) continue;
+        var td = clean(ad.textContent);
+        var sde = '';
+        var spd = box.querySelector('.result__snippet, .result-snippet, .result__snippet');
+        if (spd) sde = clean(spd.textContent);
+        add(td, ud, sde, box);
       }
     } else if (ENGINE === 'wikipedia' || ENGINE === 'wikidata') {
       var rows = document.querySelectorAll('ul.mw-search-results > li');
@@ -696,7 +698,7 @@ Parameters: query (plain text), engine (optional), page (optional, 1-based; 2 op
 Returns JSON: {"engine", "query", "page", "results": [{"title", "url", "snippet"}, ...]}. Use it to find candidate links, then open the most relevant ones with web-url-fetch.`;
 
 const server = new Server(
-  { name: "chrome-fetch-mcp", version: "1.2.1" },
+  { name: "chrome-fetch-mcp", version: "1.2.2" },
   { capabilities: { tools: {} } }
 );
 
@@ -953,9 +955,9 @@ async function handleSearch(args: Record<string, unknown>): Promise<CallToolResu
   }
 
   const eng = engine as SearchEngine;
-  const url = searchUrl(eng, query, pageNum);
-  const script = buildSearchParseScript(eng);
-  const value = await runScript(url, script, {
+  let url = searchUrl(eng, query, pageNum);
+  let script = buildSearchParseScript(eng);
+  let value = await runScript(url, script, {
     waitAfterLoad: eng === "google" ? 1600 : CONFIG.defaultWaitAfterLoad,
   });
   let data: { results?: SearchItem[] };
@@ -963,6 +965,15 @@ async function handleSearch(args: Record<string, unknown>): Promise<CallToolResu
     data = JSON.parse(value);
   } catch {
     data = { results: [] };
+  }
+  if (eng === "duckduckgo" && (!data.results || data.results.length === 0)) {
+    const liteUrl = `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}`;
+    try {
+      const v2 = await runScript(liteUrl, script, {
+        waitAfterLoad: CONFIG.defaultWaitAfterLoad,
+      });
+      data = JSON.parse(v2);
+    } catch {}
   }
   const payload = {
     engine: eng,
