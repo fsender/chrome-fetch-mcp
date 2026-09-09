@@ -24,7 +24,7 @@ interface FetchConfig {
 const CONFIG: FetchConfig = {
   chromePort: parseInt(process.env.CHROME_DEBUG_PORT || "9222", 10),
   defaultFormat: (process.env.DEFAULT_FORMAT || "markdown") as Format,
-  defaultTimeout: parseInt(process.env.DEFAULT_TIMEOUT || "30000", 10),
+  defaultTimeout: parseInt(process.env.DEFAULT_TIMEOUT || "15000", 10),
   defaultMaxBytes: parseInt(process.env.DEFAULT_MAX_BYTES || "500000", 10),
   defaultRemoveRedundant: process.env.DEFAULT_REMOVE_REDUNDANT !== "false",
   defaultWaitAfterLoad: parseInt(process.env.DEFAULT_WAIT_AFTER_LOAD || "1000", 10),
