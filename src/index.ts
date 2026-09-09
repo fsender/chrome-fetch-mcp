@@ -24,7 +24,7 @@ interface FetchConfig {
 const CONFIG: FetchConfig = {
   chromePort: parseInt(process.env.CHROME_DEBUG_PORT || "9222", 10),
   defaultFormat: (process.env.DEFAULT_FORMAT || "markdown") as Format,
-  defaultTimeout: parseInt(process.env.DEFAULT_TIMEOUT || "15000", 10),
+  defaultTimeout: parseInt(process.env.DEFAULT_TIMEOUT || "20000", 10),
   defaultMaxBytes: parseInt(process.env.DEFAULT_MAX_BYTES || "500000", 10),
   defaultRemoveRedundant: process.env.DEFAULT_REMOVE_REDUNDANT !== "false",
   defaultWaitAfterLoad: parseInt(process.env.DEFAULT_WAIT_AFTER_LOAD || "1000", 10),
@@ -437,11 +437,70 @@ function buildExtractScript(opts: {
 })()`;
 }
 
+const PAGE_PROBE = `(() => {
+  try {
+    var title = document.title || '';
+    var text = '';
+    var el = document.body;
+    if (el) text = (el.textContent || '').replace(/\\s+/g, ' ').substring(0, 4000);
+    var head = (title + ' ' + text);
+    var CH_TXT = /just a moment|attention required|verify(?:ing)? you are human|checking your browser|checking the browser|one more step|security check|正在进行安全验证|正在验证您(?:的)?(?:身份|浏览器)|正在检查您的浏览器|正在安全检查|安全验证中|安全检测|人机验证|确认您(?:的)?身份|请完成安全验证|正在验证访问|验证您正在访问/i;
+    var CAP_TXT = /i am not a robot|我不是机器人|请(?:完成|输入|勾选).{0,6}验证码|验证码.{0,4}(?:不正确|错误|输入)|reCAPTCHA|recaptcha|hCaptcha|点此验证|进行.*验证码验证|请完成.*人机验证/i;
+    function anySel(sels) {
+      for (var i = 0; i < sels.length; i++) {
+        try { if (document.querySelector(sels[i])) return true; } catch (e) {}
+      }
+      return false;
+    }
+    var CH_SEL = ['[id*="challenge-running"]', '[id*="cf-chl"]', '#challenge-form', '[class*="cf_chl"]', '.cloudflare-challenge', '[id*="challenge-stage"]', 'iframe[src*="challenges.cloudflare.com"]'];
+    var CAP_SEL = ['.g-recaptcha', '#recaptcha', 'iframe[src*="recaptcha"]', '.h-captcha', '[id*="turnstile"]', '.cf-turnstile', 'iframe[title*="challenge"]'];
+    var challenge = CH_TXT.test(head) || anySel(CH_SEL);
+    var captcha = CAP_TXT.test(head) || anySel(CAP_SEL);
+    return JSON.stringify({ title: title.substring(0, 80), challenge: !!challenge, captcha: !!captcha });
+  } catch (e) {
+    return JSON.stringify({ title: '', challenge: false, captcha: false });
+  }
+})()`;
+
+async function waitForStablePage(runtime: any): Promise<{ captcha: boolean }> {
+  const budget = 20000;
+  const started = Date.now();
+  const probe = async (): Promise<{ challenge: boolean; captcha: boolean }> => {
+    try {
+      const r = await runtime.evaluate({ expression: PAGE_PROBE, returnByValue: true });
+      if (r.exceptionDetails) return { challenge: false, captcha: false };
+      const p = JSON.parse(String(r.result.value));
+      return { challenge: !!p.challenge, captcha: !!p.captcha };
+    } catch {
+      return { challenge: false, captcha: false };
+    }
+  };
+  const first = await probe();
+  if (!first.challenge && !first.captcha) return { captcha: false };
+  let cleared = 0;
+  let captchaSeen = false;
+  while (Date.now() - started < budget) {
+    const state = await probe();
+    if (state.captcha) {
+      captchaSeen = true;
+      break;
+    }
+    if (!state.challenge) {
+      cleared++;
+      if (cleared >= 2) break;
+    } else {
+      cleared = 0;
+    }
+    await new Promise((r) => setTimeout(r, 900));
+  }
+  return { captcha: captchaSeen };
+}
+
 async function runScript(
   url: string,
   script: string,
   opts: { timeout?: number; waitAfterLoad?: number; foreground?: boolean } = {}
-): Promise<string> {
+): Promise<{ value: string; captcha: boolean }> {
   const timeout = opts.timeout || CONFIG.defaultTimeout;
   const waitAfterLoad = opts.waitAfterLoad || CONFIG.defaultWaitAfterLoad;
   let targetId: string | null = null;
@@ -495,6 +554,7 @@ async function runScript(
     });
     await Promise.race([loadPromise, timeoutPromise]);
     await new Promise((r) => setTimeout(r, waitAfterLoad));
+    const stable = await waitForStablePage(Runtime);
 
     const evalResult = await Runtime.evaluate({
       expression: script,
@@ -507,7 +567,7 @@ async function runScript(
         exc.exception?.description || exc.text || "Script execution failed in page"
       );
     }
-    return String(evalResult.result.value);
+    return { value: String(evalResult.result.value), captcha: stable.captcha };
   } finally {
     try { if (client) await client.close(); } catch {}
     try { if (targetId) await CDP.Close({ id: targetId, port: CONFIG.chromePort }); } catch {}
@@ -698,7 +758,7 @@ Parameters: query (plain text), engine (optional), page (optional, 1-based; 2 op
 Returns JSON: {"engine", "query", "page", "results": [{"title", "url", "snippet"}, ...]}. Use it to find candidate links, then open the most relevant ones with web-url-fetch.`;
 
 const server = new Server(
-  { name: "chrome-fetch-mcp", version: "1.2.2" },
+  { name: "chrome-fetch-mcp", version: "1.2.3" },
   { capabilities: { tools: {} } }
 );
 
@@ -849,10 +909,12 @@ async function handleFetch(args: Record<string, unknown>): Promise<CallToolResul
     keepImageLinks,
     reddit,
   });
-  let value = await runScript(targetUrl, script, {
+  let first = await runScript(targetUrl, script, {
     timeout,
     waitAfterLoad: redditWait,
   });
+  let value = first.value;
+  let captchaSeen = first.captcha;
   let rawData = JSON.parse(value);
 
   if (
@@ -873,10 +935,12 @@ async function handleFetch(args: Record<string, unknown>): Promise<CallToolResul
         "https://old.reddit.com"
       );
       if (oldUrl !== targetUrl) {
-        value = await runScript(oldUrl, script, {
+        const retry = await runScript(oldUrl, script, {
           timeout,
           waitAfterLoad: waitAfterLoad || CONFIG.defaultWaitAfterLoad,
         });
+        value = retry.value;
+        captchaSeen = captchaSeen || retry.captcha;
         rawData = JSON.parse(value);
       }
     }
@@ -909,6 +973,7 @@ async function handleFetch(args: Record<string, unknown>): Promise<CallToolResul
         url: finalUrl,
         content: markdown,
         links: deduplicateLinks(links).slice(0, 200),
+        captcha: captchaSeen,
       },
       null,
       2
@@ -918,6 +983,14 @@ async function handleFetch(args: Record<string, unknown>): Promise<CallToolResul
       ? converter.convert(html || "")
       : converter.convertRaw(html || "");
     output = `# ${title}\n\n> URL: ${finalUrl}\n\n${markdown}`;
+  }
+
+  if (captchaSeen && format !== "json") {
+    const banner =
+      format === "html"
+        ? "<!-- This page includes CAPTCHA. -->"
+        : "# This page includes CAPTCHA.";
+    output = `${banner}\n\n${output}`;
   }
 
   if (Buffer.byteLength(output, "utf-8") > maxBytes) {
@@ -957,12 +1030,12 @@ async function handleSearch(args: Record<string, unknown>): Promise<CallToolResu
   const eng = engine as SearchEngine;
   let url = searchUrl(eng, query, pageNum);
   let script = buildSearchParseScript(eng);
-  let value = await runScript(url, script, {
+  let res = await runScript(url, script, {
     waitAfterLoad: eng === "google" ? 1600 : CONFIG.defaultWaitAfterLoad,
   });
   let data: { results?: SearchItem[] };
   try {
-    data = JSON.parse(value);
+    data = JSON.parse(res.value);
   } catch {
     data = { results: [] };
   }
@@ -972,7 +1045,7 @@ async function handleSearch(args: Record<string, unknown>): Promise<CallToolResu
       const v2 = await runScript(liteUrl, script, {
         waitAfterLoad: CONFIG.defaultWaitAfterLoad,
       });
-      data = JSON.parse(v2);
+      data = JSON.parse(v2.value);
     } catch {}
   }
   const payload = {
