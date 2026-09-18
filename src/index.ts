@@ -462,19 +462,51 @@ const PAGE_PROBE = `(() => {
   }
 })()`;
 
+function evalBounded(runtime: any, expression: string, ms: number): Promise<any> {
+  return new Promise((resolve) => {
+    let done = false;
+    const t = setTimeout(() => {
+      if (!done) {
+        done = true;
+        resolve(null);
+      }
+    }, ms);
+    runtime
+      .evaluate({ expression, returnByValue: true, awaitPromise: false })
+      .then((r: any) => {
+        if (!done) {
+          done = true;
+          clearTimeout(t);
+          resolve(r);
+        }
+      })
+      .catch(() => {
+        if (!done) {
+          done = true;
+          clearTimeout(t);
+          resolve(null);
+        }
+      });
+  });
+}
+
+async function runtimeProbe(
+  runtime: any
+): Promise<{ challenge: boolean; captcha: boolean; ok: boolean }> {
+  try {
+    const r = await evalBounded(runtime, PAGE_PROBE, 3500);
+    if (!r || r.exceptionDetails) return { challenge: false, captcha: false, ok: false };
+    const p = JSON.parse(String(r.result.value));
+    return { challenge: !!p.challenge, captcha: !!p.captcha, ok: true };
+  } catch {
+    return { challenge: false, captcha: false, ok: false };
+  }
+}
+
 async function waitForStablePage(runtime: any): Promise<{ captcha: boolean }> {
   const budget = 20000;
   const started = Date.now();
-  const probe = async (): Promise<{ challenge: boolean; captcha: boolean }> => {
-    try {
-      const r = await runtime.evaluate({ expression: PAGE_PROBE, returnByValue: true });
-      if (r.exceptionDetails) return { challenge: false, captcha: false };
-      const p = JSON.parse(String(r.result.value));
-      return { challenge: !!p.challenge, captcha: !!p.captcha };
-    } catch {
-      return { challenge: false, captcha: false };
-    }
-  };
+  const probe = () => runtimeProbe(runtime);
   const first = await probe();
   if (!first.challenge && !first.captcha) return { captcha: false };
   let cleared = 0;
@@ -500,7 +532,7 @@ async function runScript(
   url: string,
   script: string,
   opts: { timeout?: number; waitAfterLoad?: number; foreground?: boolean } = {}
-): Promise<{ value: string; captcha: boolean }> {
+): Promise<{ value: string; captcha: boolean; timedOut: boolean }> {
   const timeout = opts.timeout || CONFIG.defaultTimeout;
   const waitAfterLoad = opts.waitAfterLoad || CONFIG.defaultWaitAfterLoad;
   let targetId: string | null = null;
@@ -545,29 +577,58 @@ async function runScript(
     const loadPromise = new Promise<void>((resolve) => {
       Page.loadEventFired(() => resolve());
     });
-    await Page.navigate({ url });
-    if (opts.foreground) {
-      try { await Page.bringToFront(); } catch {}
-    }
+    let timedOut = false;
     const timeoutPromise = new Promise<never>((_, reject) => {
       setTimeout(() => reject(new Error(`Navigation timeout after ${timeout}ms`)), timeout);
     });
-    await Promise.race([loadPromise, timeoutPromise]);
-    await new Promise((r) => setTimeout(r, waitAfterLoad));
-    const stable = await waitForStablePage(Runtime);
+    const navAndLoad = (async () => {
+      await Page.navigate({ url });
+      if (opts.foreground) {
+        try { await Page.bringToFront(); } catch {}
+      }
+      await loadPromise;
+    })();
+    try {
+      await Promise.race([navAndLoad, timeoutPromise]);
+    } catch (e: any) {
+      if (String(e.message).indexOf("Navigation timeout") !== -1) {
+        timedOut = true;
+      } else {
+        throw e;
+      }
+    }
+    await new Promise((r) => setTimeout(r, timedOut ? 300 : waitAfterLoad));
+    let captcha = false;
+    if (timedOut) {
+      const p = await runtimeProbe(Runtime);
+      captcha = p.captcha;
+      if (!p.ok) {
+        return {
+          value: JSON.stringify({ title: "", url: url, html: "", links: [] }),
+          captcha,
+          timedOut: true,
+        };
+      }
+    } else {
+      const stable = await waitForStablePage(Runtime);
+      captcha = stable.captcha;
+    }
 
-    const evalResult = await Runtime.evaluate({
-      expression: script,
-      returnByValue: true,
-      awaitPromise: false,
-    });
+    const evalResult = await evalBounded(Runtime, script, timedOut ? 6000 : timeout);
+    if (evalResult === null) {
+      return {
+        value: JSON.stringify({ title: "", url: url, html: "", links: [] }),
+        captcha,
+        timedOut: true,
+      };
+    }
     if (evalResult.exceptionDetails) {
       const exc = evalResult.exceptionDetails;
       throw new Error(
         exc.exception?.description || exc.text || "Script execution failed in page"
       );
     }
-    return { value: String(evalResult.result.value), captcha: stable.captcha };
+    return { value: String(evalResult.result.value), captcha, timedOut };
   } finally {
     try { if (client) await client.close(); } catch {}
     try { if (targetId) await CDP.Close({ id: targetId, port: CONFIG.chromePort }); } catch {}
@@ -758,7 +819,7 @@ Parameters: query (plain text), engine (optional), page (optional, 1-based; 2 op
 Returns JSON: {"engine", "query", "page", "results": [{"title", "url", "snippet"}, ...]}. Use it to find candidate links, then open the most relevant ones with web-url-fetch.`;
 
 const server = new Server(
-  { name: "chrome-fetch-mcp", version: "1.2.3" },
+  { name: "chrome-fetch-mcp", version: "1.2.4" },
   { capabilities: { tools: {} } }
 );
 
@@ -915,6 +976,7 @@ async function handleFetch(args: Record<string, unknown>): Promise<CallToolResul
   });
   let value = first.value;
   let captchaSeen = first.captcha;
+  let navTimedOut = first.timedOut;
   let rawData = JSON.parse(value);
 
   if (
@@ -941,10 +1003,29 @@ async function handleFetch(args: Record<string, unknown>): Promise<CallToolResul
         });
         value = retry.value;
         captchaSeen = captchaSeen || retry.captcha;
+        navTimedOut = navTimedOut || retry.timedOut;
         rawData = JSON.parse(value);
       }
     }
   }
+
+  if (navTimedOut) {
+    const hasTitle = !!(rawData.title && String(rawData.title).trim());
+    const hasHtml = !!(rawData.html && String(rawData.html).trim());
+    const hasLinks = Array.isArray(rawData.links) && rawData.links.length > 0;
+    if (!hasTitle && !hasHtml && !hasLinks) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Navigation timeout after ${timeout}ms: page still blank (no content loaded) for ${url}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+
   const { title, url: finalUrl, html, links, error: extractError } = rawData;
 
   if (extractError) {
@@ -1039,7 +1120,11 @@ async function handleSearch(args: Record<string, unknown>): Promise<CallToolResu
   } catch {
     data = { results: [] };
   }
-  if (eng === "duckduckgo" && (!data.results || data.results.length === 0)) {
+  if (
+    eng === "duckduckgo" &&
+    !res.timedOut &&
+    (!data.results || data.results.length === 0)
+  ) {
     const liteUrl = `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}`;
     try {
       const v2 = await runScript(liteUrl, script, {
@@ -1048,11 +1133,23 @@ async function handleSearch(args: Record<string, unknown>): Promise<CallToolResu
       data = JSON.parse(v2.value);
     } catch {}
   }
+  const results = data.results || [];
+  if (res.timedOut && results.length === 0) {
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `Navigation timeout after ${CONFIG.defaultTimeout}ms: search page still blank (no results loaded) for ${eng}`,
+        },
+      ],
+      isError: true,
+    };
+  }
   const payload = {
     engine: eng,
     query,
     page: pageNum,
-    results: data.results || [],
+    results,
   };
   return {
     content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }],
